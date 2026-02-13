@@ -41,7 +41,10 @@ async def update_handler(request):
 # =========================
 async def trigger_handler(request):
     event_id = request.match_info["eventId"]
-    password = request.match_info.get("password")
+    password = (
+      request.match_info.get("password")
+      or request.query.get("password")
+    )
 
     entry = events.get(event_id)
     if not entry:

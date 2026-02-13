@@ -1,84 +1,76 @@
-import asyncio
-import json
-import uuid
-from aiohttp import web, WSMsgType
+import time
+from aiohttp import web, ClientSession
 
 events = {}
-pending_responses = {}
 
-
-# =========================
-# WebSocket Handler
-# =========================
-async def ws_handler(request):
-    ws = web.WebSocketResponse(heartbeat=30)
-    await ws.prepare(request)
-
-    try:
-        async for msg in ws:
-            if msg.type == WSMsgType.TEXT:
-                data = json.loads(msg.data)
-
-                # Registrierung
-                if data["type"] == "register":
-                    events[data["eventId"]] = {
-                        "password": data["password"],
-                        "ws": ws
-                    }
-                    print("Registered event:", data["eventId"])
-
-                # Antwort vom Client-Server
-                elif data["type"] == "response":
-                    request_id = data["requestId"]
-                    if request_id in pending_responses:
-                        future = pending_responses.pop(request_id)
-                        future.set_result(data["result"])
-
-    finally:
-        # Cleanup bei Disconnect
-        for event_id, entry in list(events.items()):
-            if entry["ws"] is ws:
-                del events[event_id]
-
-    return ws
-
+HTML_FORM = """
+<!DOCTYPE html>
+<html>
+<head>
+  <title>Event auslösen</title>
+</head>
+<body>
+  <h2>Passwort eingeben</h2>
+  <form method="GET">
+    <input type="password" name="password" autofocus />
+    <button type="submit">Event auslösen</button>
+  </form>
+</body>
+</html>
+"""
 
 # =========================
-# HTTP Event Endpoint
+# Update / Heartbeat
 # =========================
-async def event_handler(request):
+async def update_handler(request):
     body = await request.json()
 
-    event_id = body.get("eventId")
-    password = body.get("password")
-    data = body.get("data")
+    event_id = body["eventId"]
+    events[event_id] = {
+        "password": body["password"],
+        "callback": body["callback"],
+        "last_seen": time.time()
+    }
+
+    print(f"[UPDATE] {event_id} → {body['callback']}")
+    return web.json_response({"status": "updated"})
+
+
+# =========================
+# Trigger (GET)
+# =========================
+async def trigger_handler(request):
+    event_id = request.match_info["eventId"]
+    password = request.match_info.get("password")
 
     entry = events.get(event_id)
-    if not entry or entry["password"] != password:
-        return web.json_response(
-            {"error": "Invalid event or password"},
-            status=403
-        )
+    if not entry:
+        return web.Response(text="Event nicht registriert", status=404)
 
-    request_id = str(uuid.uuid4())
-    loop = asyncio.get_event_loop()
-    future = loop.create_future()
-    pending_responses[request_id] = future
+    # Passwort fehlt → Formular anzeigen
+    if not password:
+        return web.Response(text=HTML_FORM, content_type="text/html")
 
-    await entry["ws"].send_json({
-        "type": "event",
-        "requestId": request_id,
-        "data": data
-    })
+    if password != entry["password"]:
+        return web.Response(text="Falsches Passwort", status=403)
 
     try:
-        result = await asyncio.wait_for(future, timeout=10)
-        return web.json_response(result)
-    except asyncio.TimeoutError:
-        pending_responses.pop(request_id, None)
-        return web.json_response(
-            {"error": "Timeout"},
-            status=504
+        async with ClientSession() as session:
+            async with session.post(
+                entry["callback"],
+                json={"eventId": event_id}
+            ):
+                pass
+
+        age = int(time.time() - entry["last_seen"])
+        return web.Response(
+            text=f"Event ausgelöst ✅ (letztes Update vor {age}s)"
+        )
+
+    except Exception as e:
+        return web.Response(
+            text=f"Callback nicht erreichbar ❌\n{e}",
+            status=502
         )
 
 
@@ -86,7 +78,8 @@ async def event_handler(request):
 # App Setup
 # =========================
 app = web.Application()
-app.router.add_get("/ws", ws_handler)
-app.router.add_post("/event", event_handler)
+app.router.add_post("/update", update_handler)
+app.router.add_get("/e/{eventId}", trigger_handler)
+app.router.add_get("/e/{eventId}/{password}", trigger_handler)
 
 web.run_app(app, port=8080)
